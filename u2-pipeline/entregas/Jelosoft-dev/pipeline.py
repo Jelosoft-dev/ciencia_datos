@@ -8,6 +8,7 @@ Uso, desde la raíz del repositorio:
     python u2-pipeline/entregas/Jelosoft-dev/pipeline.py
 """
 
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -22,19 +23,61 @@ NOMBRE_PIPELINE = "rick_and_morty_pipeline"
 ESQUEMA = "rick_and_morty"
 TIMEOUT_SEGUNDOS = 15
 
+# La API limita las peticiones seguidas y responde 429 (Too Many Requests).
+PAUSA_ENTRE_PAGINAS = 0.3  # segundos entre una página y la siguiente
+MAX_INTENTOS = 5  # intentos por página ante 429 o errores 5xx
+ESPERA_BASE = 1.0  # segundos; se duplica en cada reintento (1, 2, 4, 8...)
+CODIGOS_REINTENTABLES = {429, 500, 502, 503, 504}
+
+# Se guarda en una variable para que las pruebas puedan reemplazarla y no esperar.
+esperar = time.sleep
+
+
+def segundos_de_espera(respuesta: Any, intento: int) -> float:
+    """Usa la cabecera ``Retry-After`` si la API la envía; si no, espera exponencial."""
+    cabeceras = getattr(respuesta, "headers", None) or {}
+    valor = cabeceras.get("Retry-After")
+    if valor is not None:
+        try:
+            return max(float(valor), 0.0)
+        except ValueError:
+            pass
+    return ESPERA_BASE * 2**intento
+
+
+def pedir_con_reintentos(http: Any, url: str) -> Any:
+    """Hace el GET y lo repite, esperando cada vez más, si la API responde 429 o 5xx.
+
+    Si tras ``MAX_INTENTOS`` sigue fallando, devuelve la última respuesta para que
+    ``raise_for_status`` la convierta en error.
+    """
+    for intento in range(MAX_INTENTOS):
+        respuesta = http.get(url, timeout=TIMEOUT_SEGUNDOS)
+        if respuesta.status_code not in CODIGOS_REINTENTABLES or intento == MAX_INTENTOS - 1:
+            return respuesta
+        segundos = segundos_de_espera(respuesta, intento)
+        print(f"La API respondió {respuesta.status_code}; reintento en {segundos:.1f} s ({url})")
+        esperar(segundos)
+    return respuesta
+
 
 def obtener_paginas(url: str, session: Any = None) -> Iterator[list[dict]]:
     """Recorre la paginación de la API y devuelve la lista ``results`` de cada página.
 
     La API indica la siguiente página en ``info.next`` (``None`` en la última).
     Un 404 significa "no hay resultados" y se trata como respuesta vacía.
-    Los errores de conexión o de HTTP (5xx, etc.) se propagan para que el
-    pipeline falle de forma visible en lugar de cargar datos incompletos.
+    Ante 429 o 5xx se reintenta con espera; si el error persiste, o si falla la
+    conexión, la excepción se propaga para que el pipeline falle de forma visible
+    en lugar de cargar datos incompletos.
     """
     http = session or requests.Session()
     siguiente: str | None = url
+    primera = True
     while siguiente:
-        respuesta = http.get(siguiente, timeout=TIMEOUT_SEGUNDOS)
+        if not primera:
+            esperar(PAUSA_ENTRE_PAGINAS)
+        primera = False
+        respuesta = pedir_con_reintentos(http, siguiente)
         if respuesta.status_code == 404:
             return
         respuesta.raise_for_status()

@@ -28,9 +28,12 @@ def personaje(id_: int, estado: str = "Alive", especie: str = "Human") -> dict:
 
 
 class RespuestaFalsa:
-    def __init__(self, status_code: int = 200, cuerpo: dict | None = None):
+    def __init__(
+        self, status_code: int = 200, cuerpo: dict | None = None, headers: dict | None = None
+    ):
         self.status_code = status_code
         self._cuerpo = cuerpo
+        self.headers = headers or {}
 
     def json(self):
         return self._cuerpo
@@ -41,7 +44,11 @@ class RespuestaFalsa:
 
 
 class SesionFalsa:
-    """Devuelve respuestas preparadas según la URL y registra las llamadas."""
+    """Devuelve respuestas preparadas según la URL y registra las llamadas.
+
+    Si para una URL se da una lista, se devuelve un elemento por llamada (el último
+    se repite), lo que permite simular "primero 429, después 200".
+    """
 
     def __init__(self, respuestas: dict):
         self.respuestas = respuestas
@@ -50,9 +57,19 @@ class SesionFalsa:
     def get(self, url, timeout=None):
         self.llamadas.append(url)
         respuesta = self.respuestas[url]
+        if isinstance(respuesta, list):
+            respuesta = respuesta.pop(0) if len(respuesta) > 1 else respuesta[0]
         if isinstance(respuesta, Exception):
             raise respuesta
         return respuesta
+
+
+@pytest.fixture(autouse=True)
+def esperas(monkeypatch) -> list[float]:
+    """Reemplaza las pausas reales por una lista que registra cuánto se habría esperado."""
+    registradas: list[float] = []
+    monkeypatch.setattr(pipeline, "esperar", registradas.append)
+    return registradas
 
 
 def sesion_dos_paginas() -> SesionFalsa:
@@ -134,6 +151,40 @@ def test_error_del_servidor_se_propaga():
     sesion = SesionFalsa({f"{BASE}/character": RespuestaFalsa(status_code=500)})
     with pytest.raises(requests.HTTPError):
         list(pipeline.obtener_paginas(f"{BASE}/character", session=sesion))
+
+
+def test_429_se_reintenta_respetando_retry_after(esperas):
+    sesion = SesionFalsa(
+        {
+            f"{BASE}/character": [
+                RespuestaFalsa(status_code=429, headers={"Retry-After": "3"}),
+                RespuestaFalsa(status_code=429),
+                RespuestaFalsa(cuerpo={"info": {"next": None}, "results": [personaje(1)]}),
+            ]
+        }
+    )
+
+    registros = extraer(sesion)
+
+    assert [r["id"] for r in registros] == [1]
+    assert len(sesion.llamadas) == 3
+    # 3 s por la cabecera Retry-After; luego espera exponencial (2 s en el 2.º intento).
+    assert esperas == [3.0, 2.0]
+
+
+def test_429_persistente_falla_tras_agotar_intentos(esperas):
+    sesion = SesionFalsa({f"{BASE}/character": RespuestaFalsa(status_code=429)})
+
+    with pytest.raises(requests.HTTPError):
+        list(pipeline.obtener_paginas(f"{BASE}/character", session=sesion))
+
+    assert len(sesion.llamadas) == pipeline.MAX_INTENTOS
+    assert esperas == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_pausa_entre_paginas(esperas):
+    extraer(sesion_dos_paginas())
+    assert esperas == [pipeline.PAUSA_ENTRE_PAGINAS]
 
 
 def test_pipeline_carga_en_duckdb_y_verificacion(tmp_path):
